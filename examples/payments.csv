@@ -1,0 +1,7 @@
+payment_id,payer,amount,currency
+PAY-01,Acorn Demo,1500.00,USD
+PAY-02,BIRCH-DEMO,1200.00,USD
+PAY-03,Cedar Demo,1100.00,USD
+PAY-04,Cedar Demo,1100.00,USD
+PAY-05,Delta Demo,500.00,USD
+PAY-06,Elm Demo,400.00,USD
