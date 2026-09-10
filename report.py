@@ -32,7 +32,7 @@ def text(draw, x, y, value, size=32, fill=INK, width=1420):
     draw.text((x, y), value, font=face, fill=fill)
 
 
-def wrapped(draw, x, y, value, size=28, width=620):
+def wrapped(draw, x, y, value, size=28, width=620, max_lines=None):
     words = str(value).split(); line = ''; lines = []
     for word in words:
         attempt = (line + ' ' + word).strip()
@@ -41,6 +41,9 @@ def wrapped(draw, x, y, value, size=28, width=620):
         else:
             line = attempt
     if line: lines.append(line)
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] += '...'
     for index, line in enumerate(lines):
         text(draw, x, y + index * (size + 10), line, size, width=width)
     return len(lines) * (size + 10)
@@ -92,33 +95,70 @@ def render_overview(plan, output):
     for page, offset in enumerate(range(0, len(rows), 6), 1):
         shown = rows[offset:offset + 6]
         totals = plan['totals_cents']
-        header_height = 250 + 75 * len(totals)
+        total_spacing = 125 if 'decision_provenance' in plan else 75
+        header_height = 250 + total_spacing * len(totals)
         height = header_height + 138 * len(shown) + 120
         image, draw = canvas(height)
         text(draw, 80, 108, 'Every match has an explanation.', 62)
         for n, (currency, sums) in enumerate(sorted(totals.items())):
-            y = 200 + n * 75
+            y = 200 + n * total_spacing
             text(draw, 80, y, currency, 34, MUTED, 125)
             text(draw, 220, y, money(sums['SUGGESTED']) + ' suggested', 34, GREEN, 620)
             text(draw, 880, y, money(sums['REVIEW']) + ' held for review', 34, AMBER, 630)
+            if 'SELECTED' in sums:
+                text(draw, 220, y + 49, money(sums['SELECTED']) + ' reviewer selected', 30, BLUE, 1100)
         y = header_height
         for r in shown:
-            color = GREEN if r['status'] == 'SUGGESTED' else AMBER
+            color = {'SUGGESTED': GREEN, 'SELECTED': BLUE}.get(r['status'], AMBER)
             card(draw, (80, y, 1520, y + 118))
             text(draw, 108, y + 18, r['payment_id'], 31, INK, 200)
             text(draw, 330, y + 18, r['currency'] + ' ' + money(r['cents']), 31, INK, 340)
             text(draw, 720, y + 18, r['status'], 28, color, 740)
             reason = r['reason']
             if r['status'] == 'SUGGESTED': reason = ' + '.join(r['options'][0]) + ' = exact total; no competing payment'
+            if r['status'] == 'SELECTED': reason = ' + '.join(r['selected_invoice_ids']) + ' / ' + r['evidence']
             text(draw, 108, y + 67, reason, 27, MUTED, 1370)
             y += 138
         text(draw, 80, y + 25, f'Review suggestions before use. No payments posted.  /  Page {page}', 25, MUTED)
         image.save(output/f'overview-{page:03}.png')
 
 
+def render_resolution(plan, payment, output):
+    """Show an actual explicit selection and its preserved original hold."""
+    image = Image.new('RGB', (1000, 1330), BG)
+    draw = ImageDraw.Draw(image)
+    text(draw, 50, 32, 'REMITTANCE MAP / RECORDED REVIEW', 23, BLUE, 900)
+    text(draw, 50, 96, 'A match needs', 68, width=900)
+    text(draw, 50, 173, 'more than math.', 68, width=900)
+    text(draw, 50, 270, payment['payment_id'] + ' / ' + payment['currency'] + ' ' + money(payment['cents']), 37, INK, 900)
+    card(draw, (50, 344, 950, 576), AMBER)
+    text(draw, 78, 367, 'BEFORE / HELD', 31, AMBER, 844)
+    wrapped(draw, 78, 424, payment['original_reason'], 31, 844)
+    if len(payment['options']) > 1:
+        text(draw, 78, 525, 'Two exact bundles. The total cannot choose.', 28, MUTED, 844)
+    draw.line((500, 584, 500, 638), fill=GREEN, width=5)
+    draw.polygon([(483, 622), (517, 622), (500, 642)], fill=GREEN)
+    card(draw, (50, 650, 950, 1050), GREEN)
+    text(draw, 78, 674, 'AFTER / REVIEWER SELECTED', 31, GREEN, 844)
+    text(draw, 78, 736, ' + '.join(payment['selected_invoice_ids']), 48, INK, 844)
+    text(draw, 78, 800, '= ' + payment['currency'] + ' ' + money(payment['cents']), 43, GREEN, 844)
+    text(draw, 78, 878, 'RECORDED EVIDENCE', 23, MUTED, 844)
+    wrapped(draw, 78, 920, payment['evidence'], 26, 844, max_lines=3)
+    held = sum(r['status'] == 'REVIEW' for r in plan['payments'])
+    label = f'{held} other payment' + ('' if held == 1 else 's') + ' still held.'
+    text(draw, 50, 1101, label, 40, AMBER, 900)
+    text(draw, 50, 1167, 'No remaining hold was released automatically.', 27, MUTED, 900)
+    text(draw, 50, 1220, 'Choice bound to original input + review hashes.', 27, BLUE, 900)
+    text(draw, 50, 1270, 'Local review record. No transactions posted.', 24, MUTED, 900)
+    image.save(output/'resolution.png')
+
+
 def render(plan, output):
     output = Path(output)
     render_overview(plan, output)
-    ambiguous = next((r for r in plan['payments'] if len(r['options']) > 1), None)
+    ambiguous = next((r for r in plan['payments'] if r['status'] == 'REVIEW' and len(r['options']) > 1), None)
     if ambiguous:
         render_ambiguity(plan, ambiguous, output)
+    selected = next((r for r in plan['payments'] if r['status'] == 'SELECTED'), None)
+    if selected:
+        render_resolution(plan, selected, output)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import io
@@ -145,7 +146,98 @@ def audit(invoices, payments, aliases):
             'max_rows_per_input': MAX_ROWS, 'options_shown': 'At most two witnesses; not an exhaustive allocation list'}}
 
 
-def build(invoice_path, payment_path, alias_path, output):
+def json_bytes(value):
+    return (json.dumps(value, indent=2) + '\n').encode('utf-8')
+
+
+def decision_template(plan):
+    return {'schema_version': 1, 'input_sha256': plan['input_sha256'],
+            'plan_sha256': hashlib.sha256(json_bytes(plan)).hexdigest(), 'selections': []}
+
+
+def unique_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate decision field: {key}')
+        result[key] = value
+    return result
+
+
+def apply_decisions(plan, data):
+    """Validate the whole decision file before producing any changed plan.
+
+    A choice is a recorded human selection, never a newly inferred suggestion.
+    Unselected holds remain held, including payments competing with a choice.
+    """
+    decisions = json.loads(data.decode('utf-8'), object_pairs_hook=unique_keys)
+    template = decision_template(plan)
+    if not isinstance(decisions, dict) or set(decisions) != set(template):
+        raise ValueError('Decisions must use the fields from decisions-template.json')
+    if type(decisions['schema_version']) is not int or decisions['schema_version'] != 1:
+        raise ValueError('Unsupported decision schema version')
+    if decisions['input_sha256'] != template['input_sha256'] or decisions['plan_sha256'] != template['plan_sha256']:
+        raise ValueError('Stale decisions: inputs or original review changed; review again and copy a fresh template')
+    choices = decisions['selections']
+    if not isinstance(choices, list) or not 1 <= len(choices) <= len(plan['payments']):
+        raise ValueError('Add at least one selection; no more than one per payment')
+    rows = {r['payment_id']: r for r in plan['payments']}
+    invoices = {i['invoice_id']: i for i in plan['invoices']}
+    used = {i for r in plan['payments'] if r['status'] == 'SUGGESTED' for i in r['options'][0]}
+    selected = {}
+    for choice in choices:
+        if not isinstance(choice, dict) or set(choice) != {'payment_id', 'invoice_ids', 'evidence'}:
+            raise ValueError('Each selection needs payment_id, invoice_ids and evidence')
+        payment_id = choice['payment_id']
+        if not isinstance(payment_id, str) or payment_id not in rows:
+            raise ValueError('Selection refers to an unknown payment ID')
+        if payment_id in selected:
+            raise ValueError('Duplicate payment selection')
+        row = rows[payment_id]
+        if row['status'] != 'REVIEW':
+            raise ValueError('Only held payments accept reviewer selections')
+        if row['customer_id'] is None:
+            raise ValueError('Resolve the payer alias and rerun before selecting invoices')
+        ids = choice['invoice_ids']
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_ROWS or
+                any(not isinstance(i, str) or i not in invoices for i in ids)):
+            raise ValueError('Select a nonempty list of known invoice IDs')
+        if len(set(ids)) != len(ids):
+            raise ValueError('Duplicate invoice in selection')
+        if any(invoices[i]['customer_id'] != row['customer_id'] or
+               invoices[i]['currency'] != row['currency'] for i in ids):
+            raise ValueError('Selected invoices must belong to the payment customer and currency')
+        if sum(invoices[i]['cents'] for i in ids) != row['cents']:
+            raise ValueError('Selected whole-invoice amounts must equal the payment exactly')
+        if used.intersection(ids):
+            raise ValueError('Invoice reuse: selections must be disjoint from suggestions and other selections')
+        evidence = choice['evidence']
+        if (not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 240 or
+                any(ord(c) < 32 for c in evidence)):
+            raise ValueError('Evidence must be a nonempty single line of at most 240 characters')
+        used.update(ids)
+        selected[payment_id] = {**choice, 'invoice_ids': sorted(ids)}
+    result = copy.deepcopy(plan)
+    result['decision_provenance'] = {
+        'decisions_sha256': hashlib.sha256(data).hexdigest(),
+        'original_plan_sha256': template['plan_sha256'],
+        'policy': 'Explicit reviewer selections only; all other held payments remain held'}
+    for row in result['payments']:
+        if row['payment_id'] in selected:
+            choice = selected[row['payment_id']]
+            row.update(status='SELECTED', original_status='REVIEW', original_reason=row['reason'],
+                       selected_invoice_ids=choice['invoice_ids'], evidence=choice['evidence'],
+                       reason='Reviewer selected invoices; no transaction posted')
+    for sums in result['totals_cents'].values():
+        sums['SELECTED'] = 0
+    for row in result['payments']:
+        if row['status'] == 'SELECTED':
+            sums = result['totals_cents'][row['currency']]
+            sums['REVIEW'] -= row['cents']; sums['SELECTED'] += row['cents']
+    return result
+
+
+def build(invoice_path, payment_path, alias_path, output, decisions_path=None):
     from report import render
     paths = [Path(p) for p in (invoice_path, payment_path, alias_path)]
     data = [p.read_bytes() for p in paths]
@@ -154,11 +246,28 @@ def build(invoice_path, payment_path, alias_path, output):
     aliases = load_csv(data[2], ['payer', 'customer_id'])
     plan = audit(invoices, payments, aliases)
     plan['input_sha256'] = dict(zip(['invoices', 'payments', 'aliases'], [hashlib.sha256(d).hexdigest() for d in data]))
+    original = json_bytes(plan)
+    decisions_data = Path(decisions_path).read_bytes() if decisions_path is not None else None
+    if decisions_data is not None:
+        plan = apply_decisions(plan, decisions_data)
     output = Path(output)
     # Atomic exclusive reservation. Never overwrite another result, even an empty directory.
     output.mkdir(mode=0o700)
     try:
-        (output/'plan.json').write_text(json.dumps(plan, indent=2) + '\n', encoding='utf-8')
+        (output/'plan.json').write_bytes(json_bytes(plan))
+        if decisions_data is None:
+            (output/'decisions-template.json').write_bytes(json_bytes(decision_template(plan)))
+        else:
+            (output/'original-plan.json').write_bytes(original)
+            (output/'decisions.json').write_bytes(decisions_data)
+            with (output/'selected.csv').open('w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['payment_id', 'invoice_id', 'currency', 'decisions_sha256'])
+                for row in plan['payments']:
+                    if row['status'] == 'SELECTED':
+                        for invoice_id in row['selected_invoice_ids']:
+                            writer.writerow([row['payment_id'], invoice_id, row['currency'],
+                                             plan['decision_provenance']['decisions_sha256']])
         with (output/'suggestions.csv').open('w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f); writer.writerow(['payment_id', 'invoice_id', 'currency'])
             for row in plan['payments']:
@@ -181,9 +290,10 @@ def main():
     parser.add_argument('--payments', type=Path, required=True)
     parser.add_argument('--aliases', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--decisions', type=Path, help='Completed decisions template from the original review')
     args = parser.parse_args()
     try:
-        plan = build(args.invoices, args.payments, args.aliases, args.out)
+        plan = build(args.invoices, args.payments, args.aliases, args.out, args.decisions)
     except (ValueError, OSError, UnicodeError, csv.Error) as exc:
         parser.exit(2, f'Review failed: {exc}\n')
     print(json.dumps({'payments': len(plan['payments']), 'totals_cents': plan['totals_cents'], 'mode': plan['mode']}))

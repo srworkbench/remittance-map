@@ -10,6 +10,12 @@ In this example, one USD 1,500 payment could settle either a USD 1,500 invoice o
 
 [See the full batch report](docs/overview-001.png): two payments totaling USD 1,700 have unique, disjoint bundles; four totaling USD 4,100 need review. All sample customers, amounts and records are invented.
 
+**What happens after someone reviews the ambiguity?** Record their invoice choice against the original inputs. Remittance Map checks the amount, customer, currency and invoice reuse, then produces a separate selection record. Change even one input byte and the old choice is refused.
+
+![Actual before-and-after report from the fictional reviewer-choice demo](docs/reviewer-choice.png)
+
+Here, an invented remittance identifies A-01 and A-02. That USD 1,500 payment becomes **SELECTED**; the other three held payments remain held. The original report is preserved. A selection records a reviewer's judgment; it does not prove the remittance is authentic or post a transaction.
+
 ## Why this exists
 
 Matching a payer name or finding an equal amount doesn't establish which invoices a payment settles. This tool separates those questions:
@@ -37,6 +43,14 @@ On Windows, use `.venv\Scripts\python.exe` in place of `.venv/bin/python`.
 
 Open `out/ambiguity.png` or `out/overview-001.png` in any image viewer. `demo.py` checks the expected six payment decisions and totals. To rerun, choose a new output directory; existing directories are never overwritten.
 
+Run the complete reviewer-choice example:
+
+```sh
+.venv/bin/python demo_resolution.py --out choice-demo
+```
+
+Open `choice-demo/after/resolution.png`. The example creates a review, supplies an explicitly fictional reviewer choice, and checks that the resulting selection leaves other holds unchanged. It also changes an input and verifies that the same decision file is rejected. `demo-proof.json` records the results; `before/` remains unchanged.
+
 ## Review your own CSVs
 
 Use UTF-8 CSVs with these exact headers and a positive decimal amount (at most two decimal places):
@@ -63,9 +77,45 @@ The new directory contains:
 - `suggestions.csv`: only unique, noncompeting payment/invoice ID pairs. Review them before use; this file is not an import into any accounting service.
 - `overview-*.png`: all payments, six per page, with the reason for each decision.
 - `ambiguity.png`: the first ambiguous payment and two possible bundles, when present.
+- `decisions-template.json`: input and original-plan hashes, ready to copy for a separate reviewer decision file.
 - `READY.json`: hashes of the completed output files, written last. A directory without this marker is incomplete, for example after a process kill.
 
 Keep outputs private when using real data. The JSON and images contain the information you supplied. Long image labels are shortened to fit; complete values remain in JSON. The supplied image fonts may not cover all writing systems.
+
+## Record a reviewed choice
+
+Copy `review-001/decisions-template.json` to a separate file such as `reviewer-decisions.json`. Keep both hash fields unchanged. Replace its empty `selections` list with your reviewed choice:
+
+```json
+[
+  {
+    "payment_id": "PAY-01",
+    "invoice_ids": ["A-01", "A-02"],
+    "evidence": "Fictional remittance lists A-01 and A-02."
+  }
+]
+```
+
+This is the value of `selections`, not the whole decision file. Use evidence you have actually reviewed for your own inputs. Then run the same three inputs with a new output directory:
+
+```sh
+.venv/bin/python reconcile.py \
+  --invoices examples/invoices.csv \
+  --payments examples/payments.csv \
+  --aliases examples/aliases.csv \
+  --decisions reviewer-decisions.json \
+  --out review-002
+```
+
+The whole decision file must pass before output is created. Only held payments with an unambiguous approved customer can be selected. Chosen whole invoices must total the payment exactly, share its customer and currency, and be unused by other choices or suggestions. A reviewer may choose a valid bundle beyond the two displayed witnesses. Fix unknown or shared payer aliases in the input and start a fresh review first.
+
+The new result adds:
+
+- `selected.csv`: reviewer-selected pairs, with the exact decision file's SHA-256. These are separate from automatic `suggestions.csv`.
+- `decisions.json` and `original-plan.json`: exact decision bytes and the original computed review, bound by hashes in `plan.json`.
+- `resolution.png`: the first selected payment's before/after explanation. The overview and JSON include all selections.
+
+Other held payments stay held, even when one competing payment is selected. They may still need missing invoices, a corrected alias or outside evidence. No automatic cascade attempts to guess the rest. The evidence field records what the reviewer entered; hashes detect changed inputs and bind the record, but do not authenticate a person or validate their evidence. Input edits, even whitespace, require a fresh template and review. Existing output directories are never overwritten.
 
 ## Bounds and deliberate tradeoffs
 
@@ -82,6 +132,6 @@ Keep outputs private when using real data. The JSON and images contain the infor
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Tests cover equal-total ambiguity, batch collisions, input ordering, exact-cent arithmetic, payer ambiguity, currency isolation, search limits, invalid inputs, export contents, overwrite refusal and recovery after a rendering failure.
+Tests cover equal-total ambiguity, batch collisions, input ordering, exact-cent arithmetic, payer ambiguity, currency isolation, search limits, invalid inputs, export contents, overwrite refusal and recovery after a rendering failure. Decision tests cover stale inputs and reviews, explicit collision resolution, reused invoices, wrong customer/currency/amount, choices beyond displayed witnesses, preserved reports and a real CLI rejection.
 
 MIT licensed.
